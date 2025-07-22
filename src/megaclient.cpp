@@ -33,6 +33,7 @@
 
 #include <cryptopp/hkdf.h> // required for derive key of master key
 #include <mega/common/normalized_path.h>
+#include <netinet/in.h>
 
 #include <algorithm>
 #include <cctype>
@@ -1965,6 +1966,10 @@ MegaClient::MegaClient(MegaApp* a,
     asyncfopens = 0;
     achievements_enabled = false;
     isNewSession = false;
+    
+    // Initialize streaming parsing for actionpackets
+    mActionPacketsStreamingEnabled = false;
+    mActionPacketsFirstChunkProcessed = false;
     tsLogin = 0;
     versions_disabled = false;
     accountsince = 0;
@@ -3052,8 +3057,21 @@ void MegaClient::exec()
                 {
                     insca = false;
                     insca_notlast = false;
-                    jsonsc.begin(pendingsc->in.c_str());
-                    jsonsc.enterobject();
+                    
+                    // Enable streaming parsing for actionpackets
+                    initActionPacketsStreaming();
+                    
+                    // Process the received data with streaming parsing
+                    if (processActionPacketsChunk(pendingsc->in.c_str()))
+                    {
+                        LOG_debug << "Actionpackets streaming parsing successful";
+                    }
+                    else
+                    {
+                        jsonsc.begin(pendingsc->in.c_str());
+                        jsonsc.enterobject();
+                    }
+                    
                     app->notify_network_activity(NetworkActivityChannel::SC,
                                                  NetworkActivityType::REQUEST_RECEIVED,
                                                  API_OK);
@@ -5398,7 +5416,7 @@ bool MegaClient::procsc()
                             else
                             {
                                 fetchContactsKeys();
-                                sc_pk();
+                                sc_pk(this->jsonsc);
                             }
                         }
                     }
@@ -5459,6 +5477,12 @@ bool MegaClient::procsc()
                     {
                         LOG_debug << "Processing action packets for " << string(sessionid, sizeof(sessionid));
                         insca = true;
+                        
+                        // Enable streaming parsing for actionpackets if not already enabled
+                        if (!mActionPacketsStreamingEnabled)
+                        {
+                            initActionPacketsStreaming();
+                        }
                         break;
                     }
                     // fall through
@@ -5473,11 +5497,18 @@ bool MegaClient::procsc()
 
         if (insca)
         {
+            if (mActionPacketsStreamingEnabled)
+            {
+                // streaming parsing
+                return true;
+            }
+            
+            // traditional path
             auto actionpacketStart = jsonsc.pos;
             if (jsonsc.enterobject())
             {
                 // Check if it is ok to process the current action packet.
-                if (!sc_checkActionPacket(lastAPDeletedNode.get()))
+                if (!sc_checkActionPacket(lastAPDeletedNode.get(), jsonsc))
                 {
                     // We can't continue actionpackets until we know the next mCurrentSeqtag to match against, wait for the CS request to deliver it.
                     assert(reqs.cmdsInflight());
@@ -5515,7 +5546,7 @@ bool MegaClient::procsc()
                         {
                             case name_id::u:
                                 // node update
-                                sc_updatenode();
+                                sc_updatenode(this->jsonsc);
                                 break;
 
                             case makeNameid("t"):
@@ -5525,7 +5556,7 @@ bool MegaClient::procsc()
                                 {
                                     if (!loggedIntoFolder())
                                         useralerts.beginNotingSharedNodes();
-                                    handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : lastAPDeletedNode.get(), isMoveOperation);
+                                    handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : lastAPDeletedNode.get(), isMoveOperation, this->jsonsc);
                                     mergenewshares(1);
                                     if (!loggedIntoFolder())
                                         useralerts.convertNotedSharedNodes(true, originatingUser);
@@ -5536,13 +5567,13 @@ bool MegaClient::procsc()
 
                             case name_id::d:
                                 // node deletion
-                                lastAPDeletedNode = sc_deltree();
+                                lastAPDeletedNode = sc_deltree(jsonsc);
                                 break;
 
                             case makeNameid("s"):
                             case makeNameid("s2"):
                                 // share addition/update/revocation
-                                if (sc_shares())
+                                if (sc_shares(this->jsonsc))
                                 {
                                     int creqtag = reqtag;
                                     reqtag = 0;
@@ -5553,28 +5584,28 @@ bool MegaClient::procsc()
 
                             case name_id::c:
                                 // contact addition/update
-                                sc_contacts();
+                                sc_contacts(this->jsonsc);
                                 break;
 
                             case makeNameid("k"):
                                 // crypto key request
-                                sc_keys();
+                                sc_keys(this->jsonsc);
                                 break;
 
                             case makeNameid("fa"):
                                 // file attribute update
-                                sc_fileattr();
+                                sc_fileattr(this->jsonsc);
                                 break;
 
                             case makeNameid("ua"):
                                 // user attribute update
-                                sc_userattr();
+                                sc_userattr(this->jsonsc);
                                 break;
 
                             case name_id::psts:
                             case name_id::psts_v2:
                             case makeNameid("ftr"):
-                                if (sc_upgrade(name))
+                                if (sc_upgrade(name, this->jsonsc))
                                 {
                                     app->account_updated();
                                     abortbackoff(true);
@@ -5582,37 +5613,37 @@ bool MegaClient::procsc()
                                 break;
 
                             case name_id::pses:
-                                sc_paymentreminder();
+                                sc_paymentreminder(this->jsonsc);
                                 break;
 
                             case name_id::ipc:
                                 // incoming pending contact request (to us)
-                                sc_ipc();
+                                sc_ipc(this->jsonsc);
                                 break;
 
                             case makeNameid("opc"):
                                 // outgoing pending contact request (from us)
-                                sc_opc();
+                                sc_opc(this->jsonsc);
                                 break;
 
                             case name_id::upci:
                                 // incoming pending contact request update (accept/deny/ignore)
-                                sc_upc(true);
+                                sc_upc(true, this->jsonsc);
                                 break;
 
                             case name_id::upco:
                                 // outgoing pending contact request update (from them, accept/deny/ignore)
-                                sc_upc(false);
+                                sc_upc(false, this->jsonsc);
                                 break;
 
                             case makeNameid("ph"):
                                 // public links handles
-                                sc_ph();
+                                sc_ph(this->jsonsc);
                                 break;
 
                             case makeNameid("se"):
                                 // set email
-                                sc_se();
+                                sc_se(this->jsonsc);
                                 break;
 #ifdef ENABLE_CHAT
                             case makeNameid("mcpc"):
@@ -5627,80 +5658,80 @@ bool MegaClient::procsc()
                             case makeNameid("mcfpc"): // fall-through
                             case makeNameid("mcfc"):
                                 // chat flags update
-                                sc_chatflags();
+                                sc_chatflags(this->jsonsc);
                                 break;
 
                             case makeNameid("mcpna"): // fall-through
                             case makeNameid("mcna"):
                                 // granted / revoked access to a node
-                                sc_chatnode();
+                                sc_chatnode(this->jsonsc);
                                 break;
 
                             case name_id::mcsmp:
                                 // scheduled meetings updates
-                                sc_scheduledmeetings();
+                                sc_scheduledmeetings(this->jsonsc);
                                 break;
 
                             case name_id::mcsmr:
                                 // scheduled meetings removal
-                                sc_delscheduledmeeting();
+                                sc_delscheduledmeeting(this->jsonsc);
                                 break;
 #endif
                             case makeNameid("uac"):
-                                sc_uac();
+                                sc_uac(this->jsonsc);
                                 break;
 
                             case makeNameid("la"):
                                 // last acknowledged
-                                sc_la();
+                                sc_la(this->jsonsc);
                                 break;
 
                             case makeNameid("ub"):
                                 // business account update
-                                sc_ub();
+                                sc_ub(this->jsonsc);
                                 break;
 
                             case makeNameid("sqac"):
                                 // storage quota allowance changed
-                                sc_sqac();
+                                sc_sqac(this->jsonsc);
                                 break;
 
                             case makeNameid("asp"):
                                 // new/update of a Set
-                                sc_asp();
+                                sc_asp(this->jsonsc);
                                 break;
 
                             case makeNameid("ass"):
-                                sc_ass();
+                                sc_ass(this->jsonsc);
                                 break;
 
                             case makeNameid("asr"):
                                 // removal of a Set
-                                sc_asr();
+                                sc_asr(this->jsonsc);
                                 break;
 
                             case makeNameid("aep"):
                                 // new/update of a Set Element
-                                sc_aep();
+                                sc_aep(this->jsonsc);
                                 break;
 
                             case makeNameid("aer"):
                                 // removal of a Set Element
-                                sc_aer();
+                                sc_aer(this->jsonsc);
                                 break;
                             case makeNameid("pk"):
                                 // pending keys
-                                sc_pk();
+                                sc_pk(this->jsonsc);
                                 break;
 
                             case makeNameid("uec"):
                                 // User Email Confirm (uec)
-                                sc_uec();
+                                sc_uec(this->jsonsc);
                                 break;
 
                             case makeNameid("cce"):
                                 // credit card for this user is potentially expiring soon or new card is registered
-                                sc_cce();
+                                sc_cce(this->jsonsc);
                                 break;
                         }
                     }
@@ -6510,7 +6541,7 @@ bool MegaClient::sc_checkSequenceTag(const string& tag)
 // this action packet or if we have to wait.
 // True: Action Packet can be processed.
 // False: Stop processing Action Packets, wait for cs response.
-bool MegaClient::sc_checkActionPacket(Node* lastAPDeletedNode)
+bool MegaClient::sc_checkActionPacket(Node* lastAPDeletedNode, JSON& jsonsc)
 {
     nameid cmd = 0;
 
@@ -6554,7 +6585,7 @@ bool MegaClient::sc_checkActionPacket(Node* lastAPDeletedNode)
 
 
 // server-client node update processing
-void MegaClient::sc_updatenode()
+void MegaClient::sc_updatenode(JSON& jsonsc)
 {
     handle h = UNDEF;
     handle u = 0;
@@ -6734,7 +6765,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
     {
         for (;;)
         {
-            switch (jsonsc.getnameid())
+            switch (j->getnameid())
             {
                 case makeNameid("f"):
                     if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
@@ -6783,7 +6814,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
                     return;
 
                 default:
-                    if (!jsonsc.storeobject())
+                    if (!j->storeobject())
                     {
                         return;
                     }
@@ -6793,7 +6824,7 @@ void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& fir
 }
 
 // server-client newnodes processing
-handle MegaClient::sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMatchesDelete)
+handle MegaClient::sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMatchesDelete, JSON& jsonsc)
 {
     handle originatingUser = UNDEF;
     for (;;)
@@ -6829,7 +6860,7 @@ handle MegaClient::sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHa
 // - n/o/u[/okd] (share deletion)
 // - n/o/u/k/r/ts[/ok][/ha] (share addition) (k can be asymmetric)
 // returns 0 in case of a share addition or error, 1 otherwise
-bool MegaClient::sc_shares()
+bool MegaClient::sc_shares(JSON& jsonsc)
 {
     handle h = UNDEF;
     handle oh = UNDEF;
@@ -7060,7 +7091,7 @@ bool MegaClient::sc_shares()
     }
 }
 
-bool MegaClient::sc_upgrade(nameid paymentType)
+bool MegaClient::sc_upgrade(nameid paymentType, JSON& jsonsc)
 {
     string result;
     bool success = false;
@@ -7105,7 +7136,7 @@ bool MegaClient::sc_upgrade(nameid paymentType)
     }
 }
 
-void MegaClient::sc_paymentreminder()
+void MegaClient::sc_paymentreminder(JSON& jsonsc)
 {
     m_time_t expiryts = 0;
 
@@ -7135,7 +7166,7 @@ void MegaClient::sc_paymentreminder()
 
 // user/contact updates come in the following format:
 // u:[{c/m/ts}*] - Add/modify user/contact
-void MegaClient::sc_contacts()
+void MegaClient::sc_contacts(JSON& jsonsc)
 {
     handle ou = UNDEF;
 
@@ -7166,7 +7197,7 @@ void MegaClient::sc_contacts()
 }
 
 // server-client key requests/responses
-void MegaClient::sc_keys()
+void MegaClient::sc_keys(JSON& jsonsc)
 {
     handle h;
     std::shared_ptr<Node> n;
@@ -7218,7 +7249,7 @@ void MegaClient::sc_keys()
 }
 
 // server-client file attribute update
-void MegaClient::sc_fileattr()
+void MegaClient::sc_fileattr(JSON& jsonsc)
 {
     std::shared_ptr<Node> n = NULL;
     const char* fa = NULL;
@@ -7258,7 +7289,7 @@ void MegaClient::sc_fileattr()
 }
 
 // server-client user attribute update notification
-void MegaClient::sc_userattr()
+void MegaClient::sc_userattr(JSON& jsonsc)
 {
     handle uh = UNDEF;
     User *u = NULL;
@@ -7448,7 +7479,7 @@ void MegaClient::sc_userattr()
 }
 
 // Incoming pending contact additions or updates, always triggered by the creator (reminders, deletes, etc)
-void MegaClient::sc_ipc()
+void MegaClient::sc_ipc(JSON& jsonsc)
 {
     // fields: m, ts, uts, rts, dts, msg, p, ps
     m_time_t ts = 0;
@@ -7565,7 +7596,7 @@ void MegaClient::sc_ipc()
 }
 
 // Outgoing pending contact additions or updates, always triggered by the creator (reminders, deletes, etc)
-void MegaClient::sc_opc()
+void MegaClient::sc_opc(JSON& jsonsc)
 {
     // fields: e, m, ts, uts, rts, dts, msg, p
     m_time_t ts = 0;
@@ -7663,7 +7694,7 @@ void MegaClient::sc_opc()
 }
 
 // Incoming pending contact request updates, always triggered by the receiver of the request (accepts, denies, etc)
-void MegaClient::sc_upc(bool incoming)
+void MegaClient::sc_upc(bool incoming, JSON& jsonsc)
 {
     // fields: p, uts, s, m
     m_time_t uts = 0;
@@ -7765,7 +7796,7 @@ void MegaClient::sc_upc(bool incoming)
     }
 }
 // Public links updates
-void MegaClient::sc_ph()
+void MegaClient::sc_ph(JSON& jsonsc)
 {
     // fields: h, ph, d, n, ets
     handle h = UNDEF;
@@ -7874,7 +7905,7 @@ void MegaClient::sc_ph()
     }
 }
 
-void MegaClient::sc_se()
+void MegaClient::sc_se(JSON& jsonsc)
 {
     // fields: e, s
     string email;
@@ -7946,7 +7977,7 @@ void MegaClient::sc_se()
 }
 
 #ifdef ENABLE_CHAT
-void MegaClient::sc_chatupdate(bool readingPublicChat)
+void MegaClient::sc_chatupdate(bool readingPublicChat, JSON& jsonsc)
 {
     // fields: id, u, cs, n, g, ou, ct, ts, m, ck
     handle chatid = UNDEF;
@@ -8167,7 +8198,7 @@ void MegaClient::sc_chatupdate(bool readingPublicChat)
     }
 }
 
-void MegaClient::sc_chatnode()
+void MegaClient::sc_chatnode(JSON& jsonsc)
 {
     handle chatid = UNDEF;
     handle h = UNDEF;
@@ -8251,7 +8282,7 @@ void MegaClient::sc_chatnode()
     }
 }
 
-void MegaClient::sc_chatflags()
+void MegaClient::sc_chatflags(JSON& jsonsc)
 {
     bool done = false;
     handle chatid = UNDEF;
@@ -8300,7 +8331,7 @@ void MegaClient::sc_chatflags()
 }
 
 // process mcsmr action packet
-void MegaClient::sc_delscheduledmeeting()
+void MegaClient::sc_delscheduledmeeting(JSON& jsonsc)
 {
     bool done = false;
     handle schedId = UNDEF;
@@ -8359,7 +8390,7 @@ void MegaClient::sc_delscheduledmeeting()
 }
 
 // process mcsmp action packet (parse just 1 scheduled meeting per AP)
-void MegaClient::sc_scheduledmeetings()
+void MegaClient::sc_scheduledmeetings(JSON& jsonsc)
 {
     handle ou = UNDEF;
     std::vector<std::unique_ptr<ScheduledMeeting>> schedMeetings;
@@ -8465,7 +8496,7 @@ void MegaClient::createUpdatedSMAlert(const handle& ou, handle chatid, handle sm
 
 #endif
 
-void MegaClient::sc_uac()
+void MegaClient::sc_uac(JSON& jsonsc)
 {
     string email;
     for (;;)
@@ -8497,7 +8528,7 @@ void MegaClient::sc_uac()
     }
 }
 
-void MegaClient::sc_uec()
+void MegaClient::sc_uec(JSON& jsonsc)
 {
     handle u = UNDEF;
     string email;
@@ -8540,7 +8571,7 @@ void MegaClient::sc_uec()
     }
 }
 
-void MegaClient::sc_sqac()
+void MegaClient::sc_sqac(JSON& jsonsc)
 {
     m_off_t gb = -1;
     for (;;)
@@ -8573,7 +8604,7 @@ void MegaClient::sc_sqac()
     }
 }
 
-void MegaClient::sc_pk()
+void MegaClient::sc_pk(JSON& jsonsc)
 {
     if (!mKeyManager.generation())
     {
@@ -8644,13 +8675,13 @@ void MegaClient::sc_pk()
     }));
 }
 
-void MegaClient::sc_cce()
+void MegaClient::sc_cce(JSON& jsonsc)
 {
     LOG_debug << "Processing Credit Card Expiry";
     app->notify_creditCardExpiry();
 }
 
-void MegaClient::sc_la()
+void MegaClient::sc_la(JSON& jsonsc)
 {
     for (;;)
     {
@@ -8693,7 +8724,7 @@ void MegaClient::setBusinessStatus(BizStatus newBizStatus)
     }
 }
 
-void MegaClient::sc_ub()
+void MegaClient::sc_ub(JSON& jsonsc)
 {
     BizStatus status = BIZ_STATUS_UNKNOWN;
     BizMode mode = BIZ_MODE_UNKNOWN;
@@ -9236,7 +9267,7 @@ shared_ptr<Node> MegaClient::nodeByPath(const char* path, std::shared_ptr<Node> 
 }
 
 // server-client deletion
-std::shared_ptr<Node> MegaClient::sc_deltree()
+std::shared_ptr<Node> MegaClient::sc_deltree(JSON& jsonsc)
 {
     std::shared_ptr<Node> n;
     handle originatingUser = UNDEF;
@@ -12672,7 +12703,7 @@ void MegaClient::upgradeSecurity(std::function<void(Error)> completion)
 
         // Get pending keys for inshares
         fetchContactsKeys();
-        sc_pk();
+        sc_pk(this->jsonsc);
     });
 }
 
@@ -21159,7 +21190,7 @@ const SetElement* MegaClient::addOrUpdateSetElement(SetElement&& el)
     return &added;
 }
 
-void MegaClient::sc_asp()
+void MegaClient::sc_asp(JSON& jsonsc)
 {
     Set s;
     error e = readSet(jsonsc, s);
@@ -21202,7 +21233,7 @@ void MegaClient::sc_asp()
     }
 }
 
-void MegaClient::sc_asr()
+void MegaClient::sc_asr(JSON& jsonsc)
 {
     handle setId = UNDEF;
     for (;;)
@@ -21233,7 +21264,7 @@ void MegaClient::sc_asr()
     }
 }
 
-void MegaClient::sc_aep()
+void MegaClient::sc_aep(JSON& jsonsc)
 {
     SetElement el;
     if (readElement(jsonsc, el) != API_OK)
@@ -21264,7 +21295,7 @@ void MegaClient::sc_aep()
     addOrUpdateSetElement(std::move(el));
 }
 
-void MegaClient::sc_aer()
+void MegaClient::sc_aer(JSON& jsonsc)
 {
     handle elemId = UNDEF;
     handle setId = UNDEF;
@@ -21465,7 +21496,7 @@ error MegaClient::readSetsPublicHandles(JSON& j, map<handle, Set>& sets)
     return e;
 }
 
-void MegaClient::sc_ass()
+void MegaClient::sc_ass(JSON& jsonsc)
 {
     Set s;
     const error e = readExportedSet(jsonsc, s);
@@ -24513,6 +24544,542 @@ void MegaClient::JSCDataRetrieved(GetJSCDataCallback& callback,
 void MegaClient::getMyIp(CommandGetMyIP::Cb&& completion)
 {
     reqs.add(new CommandGetMyIP(this, std::move(completion)));
+}
+
+
+// Initialize streaming parsing for actionpackets
+void MegaClient::initActionPacketsStreaming()
+{
+    mActionPacketsStreamingEnabled = true;
+    mActionPacketsFirstChunkProcessed = false;
+    mActionPacketsJsonSplitter.clear();
+    mActionPacketsFilters.clear();
+    setupActionPacketsFilters();
+}
+
+// Setup filters for actionpackets streaming parsing
+void MegaClient::setupActionPacketsFilters()
+{
+    mActionPacketsFilters.emplace("", [this](JSON* json)
+    {
+        if (!mActionPacketsFirstChunkProcessed)
+        {
+            mActionPacketsFirstChunkProcessed = true;
+        }
+        return true;
+    });
+
+    // Start of actionpacket object
+    mActionPacketsFilters.emplace("{", [this](JSON* json)
+    {
+        return true;
+    });
+
+    // End of actionpacket object
+    mActionPacketsFilters.emplace("}", [this](JSON* json)
+    {
+        return true;
+    });
+
+    // First attribute is a
+    mActionPacketsFilters.emplace("{[a{", [this](JSON* json)
+    {
+        return processActionPacketObject(json);
+    });
+
+    mActionPacketsFilters.emplace("{\"w", [this](JSON* json)
+    {
+        std::string wsurl;
+        json->storeobject(&wsurl);
+        scnotifyurl = wsurl;
+        LOG_debug << "Received websocket url: " << scnotifyurl;
+        return true;
+    });
+
+    mActionPacketsFilters.emplace("{\"sn", [this](JSON* json)
+    {
+        scsn.setScsn(json);
+        LOG_debug << "Received sequence number: " << scsn.text();
+        return true;
+    });
+}
+
+bool MegaClient::processActionPacketsChunk(const char* chunk)
+{
+    if (!mActionPacketsStreamingEnabled)
+    {
+        return false;
+    }
+
+    size_t consumed = mActionPacketsJsonSplitter.processChunk(&mActionPacketsFilters, chunk);
+    
+    if (mActionPacketsJsonSplitter.hasFailed())
+    {
+        LOG_err << "Actionpackets streaming parsing failed";
+        mActionPacketsJsonSplitter.clear();
+        return false;
+    }
+
+    // Complete actionpackets 
+    if (mActionPacketsJsonSplitter.hasFinished())
+    {
+        pendingsc.reset();
+
+        std::unique_lock<recursive_mutex> nodeTreeIsChanging(nodeTreeMutex);
+        bool originalAC = actionpacketsCurrent;
+        actionpacketsCurrent = false;
+        if (!useralerts.isDeletedSharedNodesStashEmpty())
+        {
+            useralerts.purgeNodeVersionsFromStash();
+            useralerts.convertStashedDeletedSharedNodes();
+        }
+
+
+        LOG_debug << "Processing of action packets for " << string(sessionid, sizeof(sessionid)) << " finished.  More to follow: " << insca_notlast;
+        mergenewshares(1);
+        applykeys();
+        mNewKeyRepository.clear();
+
+        if (!statecurrent && !insca_notlast)   // with actionpacket spoonfeeding, just finishing a batch does not mean we are up to date yet - keep going while "ir":1
+        {
+            if (fetchingnodes)
+            {
+                notifypurge();
+                if (sctable)
+                {
+                    LOG_debug << "DB transaction COMMIT (sessionid: " << string(sessionid, sizeof(sessionid)) << ")";
+                    sctable->commit();
+                    sctable->begin();
+                    pendingsccommit = false;
+                }
+
+                WAIT_CLASS::bumpds();
+                fnstats.timeToResult = Waiter::ds - fnstats.startTime;
+                fnstats.timeToCurrent = fnstats.timeToResult;
+
+                fetchingnodes = false;
+                restag = fetchnodestag;
+                fetchnodestag = 0;
+
+                if (!mBlockedSet && mCachedStatus.lookup(CacheableStatus::STATUS_BLOCKED, 0)) //block state not received in this execution, and cached says we were blocked last time
+                {
+                    LOG_debug << "cached blocked states reports blocked, and no block state has been received before, issuing whyamiblocked";
+                    whyamiblocked();// lets query again, to trigger transition and restoreSyncs
+                }
+
+                enabletransferresumption();
+                app->fetchnodes_result(API_OK);
+                app->notify_dbcommit();
+                fetchnodesAlreadyCompletedThisSession = true;
+
+                WAIT_CLASS::bumpds();
+                fnstats.timeToSyncsResumed = Waiter::ds - fnstats.startTime;
+
+                if (!loggedIntoFolder())
+                {
+                    // historic user alerts are not supported for public folders
+                    // now that we have fetched everything and caught up actionpackets since that state,
+                    // our next sc request can be for useralerts
+                    useralerts.begincatchup = true;
+                }
+            }
+            else
+            {
+                WAIT_CLASS::bumpds();
+                fnstats.timeToCurrent = Waiter::ds - fnstats.startTime;
+            }
+            uint64_t numNodes = mNodeManager.getNodeCount();
+            fnstats.nodesCurrent = static_cast<long long>(numNodes);
+
+            if (mKeyManager.generation())
+            {
+                // Clear in-use bit if needed for the shared nodes in ^!keys.
+                mKeyManager.syncSharekeyInUseBit();
+            }
+
+            statecurrent = true;
+            app->nodes_current();
+            mFuseService.current();
+            LOG_debug << "Cloud node tree up to date";
+
+#ifdef ENABLE_SYNC
+            // Don't start sync activity until `statecurrent` as it could take actions based on old state
+            // The reworked sync code can figure out what to do once fully up to date.
+            nodeTreeIsChanging.unlock();
+            if (!syncsAlreadyLoadedOnStatecurrent)
+            {
+                syncs.resumeSyncsOnStateCurrent();
+                syncsAlreadyLoadedOnStatecurrent = true;
+            }
+#endif
+            if (tctable && cachedfiles.size())
+            {
+                TransferDbCommitter committer(tctable);
+                for (unsigned int i = 0; i < cachedfiles.size(); i++)
+                {
+                    direction_t type = NONE;
+                    File* file = app->file_resume(&cachedfiles.at(i),
+                                                    &type,
+                                                    cachedfilesdbids.at(i));
+                    if (!file || (type != GET && type != PUT))
+                    {
+                        tctable->del(cachedfilesdbids.at(i));
+                        continue;
+                    }
+                    if (!startxfer(type, file, committer, false, false, false, UseLocalVersioningFlag, nullptr, nextreqtag()))  // TODO: should we have serialized these flags and restored them?
+                    {
+                        tctable->del(cachedfilesdbids.at(i));
+                        continue;
+                    }
+                }
+                cachedfiles.clear();
+                cachedfilesdbids.clear();
+            }
+
+            WAIT_CLASS::bumpds();
+            fnstats.timeToTransfersResumed = Waiter::ds - fnstats.startTime;
+
+            string report;
+            fnstats.toJsonArray(&report);
+
+            sendevent(99426, report.c_str(), 0);    // Treeproc performance log
+
+            // NULL vector: "notify all elements"
+            app->nodes_updated(NULL, int(numNodes));
+            app->users_updated(NULL, int(users.size()));
+            app->pcrs_updated(NULL, int(pcrindex.size()));
+            app->sets_updated(nullptr, int(mSets.size()));
+            app->setelements_updated(nullptr, int(mSetElements.size()));
+#ifdef ENABLE_CHAT
+            app->chats_updated(NULL, int(chats.size()));
+#endif
+            app->useralerts_updated(nullptr, int(useralerts.alerts.size()));
+            mNodeManager.removeChanges();
+
+            // if ^!keys doesn't exist yet -> migrate the private keys from legacy attrs to ^!keys
+            if (loggedin() == FULLACCOUNT)
+            {
+                if (!mKeyManager.generation())
+                {
+                    assert(!mKeyManager.getPostRegistration());
+                    app->upgrading_security();
+                }
+                else
+                {
+                    fetchContactsKeys();
+                    sc_pk(this->jsonsc);
+                }
+            }
+        }
+
+        {
+            // In case a fetchnodes() occurs mid-session.  We should not allow
+            // the syncs to see the new tree unless we've caught up to at least
+            // the same scsn/seqTag as we were at before.  ir:1 is not always reliable
+            bool scTagNotCaughtUp =  !mScDbStateRecord.seqTag.empty() &&
+                                        !mLargestEverSeenScSeqTag.empty() &&
+                                        (mScDbStateRecord.seqTag.size() < mLargestEverSeenScSeqTag.size() ||
+                                        (mScDbStateRecord.seqTag.size() == mLargestEverSeenScSeqTag.size() &&
+                                        mScDbStateRecord.seqTag < mLargestEverSeenScSeqTag));
+
+            bool ac = statecurrent && !insca_notlast && !scTagNotCaughtUp;
+
+            if (!originalAC && ac)
+            {
+                LOG_debug << clientname << "actionpacketsCurrent is true again";
+
+            }
+            actionpacketsCurrent = ac;
+        }
+
+        if (!insca_notlast)
+        {
+            if (mReceivingCatchUp)
+            {
+                mReceivingCatchUp = false;
+                mPendingCatchUps--;
+                LOG_debug << "catchup complete. Still pending: " << mPendingCatchUps;
+                app->catchup_result();
+            }
+        }
+
+        if (pendingsccommit && sctable && !reqs.cmdsInflight() && scsn.ready())
+        {
+            LOG_debug << "Executing postponed DB commit 1";
+            sctable->commit();
+            sctable->begin();
+            app->notify_dbcommit();
+            pendingsccommit = false;
+        }
+
+        if (pendingsccommit)
+        {
+            LOG_debug << "Postponing DB commit until cs requests finish (spoonfeeding)";
+        }
+
+#ifdef ENABLE_SYNC
+        syncs.waiter->notify();
+#endif
+        return true;
+    } else {
+        // handle already comsumed part
+        pendingsc->purge(consumed);
+    }
+    return true;
+}
+
+// Process a single actionpacket object
+bool MegaClient::processActionPacketObject(JSON* json)
+{
+    if (!json->enterobject()) {
+        return false;
+    }
+    std::shared_ptr<Node> lastAPDeletedNode;
+    nameid name;
+    // Fallback to traditional parsing
+    auto actionpacketStart = json->pos;
+    if (json->enterobject())
+    {
+        // Check if it is ok to process the current action packet.
+        if (!sc_checkActionPacket(lastAPDeletedNode.get(), *json))
+        {
+            // We can't continue actionpackets until we know the next mCurrentSeqtag to match against, wait for the CS request to deliver it.
+            assert(reqs.cmdsInflight());
+            json->pos = actionpacketStart;
+            return false;
+        }
+    }
+    json->pos = actionpacketStart;
+
+    // the "a" attribute is guaranteed to be the first in the object
+    if (json->getnameid() == makeNameid("a"))
+    {
+        if (!statecurrent)
+        {
+            fnstats.actionPackets++;
+        }
+
+        name = json->getnameidvalue();
+
+        // only process server-client request if not marked as
+        // self-originating ("i" marker element guaranteed to be following
+        // "a" element if present)
+
+        if (fetchingnodes || !Utils::startswith(json->pos, "\"i\":\"") ||
+            memcmp(json->pos + 5, sessionid, sizeof sessionid) ||
+            json->pos[5 + sizeof sessionid] != '"' || name == name_id::d ||
+            name == 't') // we still set 'i' on move commands to produce backward
+                            // compatible actionpackets, so don't skip those here
+        {
+
+#ifdef ENABLE_CHAT
+            bool readingPublicChat = false;
+#endif
+            switch (name)
+            {
+                case name_id::u:
+                    // node update
+                    sc_updatenode(*json);
+                    break;
+
+                case makeNameid("t"):
+                {
+                    bool isMoveOperation = false;
+                    // node addition
+                    {
+                        if (!loggedIntoFolder())
+                            useralerts.beginNotingSharedNodes();
+
+                        handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : lastAPDeletedNode.get(), isMoveOperation, *json);
+
+                        mergenewshares(1);
+
+                        if (!loggedIntoFolder())
+                            useralerts.convertNotedSharedNodes(true, originatingUser);
+                    }
+                    lastAPDeletedNode = nullptr;
+                }
+                break;
+
+                case name_id::d:
+                    // node deletion
+                    lastAPDeletedNode = sc_deltree(*json);
+                    break;
+
+                case makeNameid("s"):
+                case makeNameid("s2"):
+                    // share addition/update/revocation
+                    if (sc_shares(*json))
+                    {
+                        int creqtag = reqtag;
+                        reqtag = 0;
+                        mergenewshares(1);
+                        reqtag = creqtag;
+                    }
+                    break;
+
+                case name_id::c:
+                    // contact addition/update
+                    sc_contacts(*json);
+                    break;
+
+                case makeNameid("k"):
+                    // crypto key request
+                    sc_keys(*json);
+                    break;
+
+                case makeNameid("fa"):
+                    // file attribute update
+                    sc_fileattr(*json);
+                    break;
+
+                case makeNameid("ua"):
+                    // user attribute update
+                    sc_userattr(*json);
+                    break;
+
+                case name_id::psts:
+                case name_id::psts_v2:
+                case makeNameid("ftr"):
+                    if (sc_upgrade(name, *json))
+                    {
+                        app->account_updated();
+                        abortbackoff(true);
+                    }
+                    break;
+
+                case name_id::pses:
+                    sc_paymentreminder(*json);
+                    break;
+
+                case name_id::ipc:
+                    // incoming pending contact request (to us)
+                    sc_ipc(*json);
+                    break;
+
+                case makeNameid("opc"):
+                    // outgoing pending contact request (from us)
+                    sc_opc(*json);
+                    break;
+
+                case name_id::upci:
+                    // incoming pending contact request update (accept/deny/ignore)
+                    sc_upc(true, *json);
+                    break;
+
+                case name_id::upco:
+                    // outgoing pending contact request update (from them, accept/deny/ignore)
+                    sc_upc(false, *json);
+                    break;
+
+                case makeNameid("ph"):
+                    // public links handles
+                    sc_ph(*json);
+                    break;
+
+                case makeNameid("se"):
+                    // set email
+                    sc_se(*json);
+                    break;
+#ifdef ENABLE_CHAT
+                case makeNameid("mcpc"):
+                {
+                    readingPublicChat = true;
+                } // fall-through
+                case makeNameid("mcc"):
+                    // chat creation / peer's invitation / peer's removal
+                    sc_chatupdate(readingPublicChat, *json);
+                    break;
+
+                case makeNameid("mcfpc"): // fall-through
+                case makeNameid("mcfc"):
+                    // chat flags update
+                    sc_chatflags(*json);
+                    break;
+
+                case makeNameid("mcpna"): // fall-through
+                case makeNameid("mcna"):
+                    // granted / revoked access to a node
+                    sc_chatnode(*json);
+                    break;
+
+                case name_id::mcsmp:
+                    // scheduled meetings updates
+                    sc_scheduledmeetings(*json);
+                    break;
+
+                case name_id::mcsmr:
+                    // scheduled meetings removal
+                    sc_delscheduledmeeting(*json);
+                    break;
+#endif
+                case makeNameid("uac"):
+                    sc_uac(*json);
+                    break;
+
+                case makeNameid("la"):
+                    // last acknowledged
+                    sc_la(*json);
+                    break;
+
+                case makeNameid("ub"):
+                    // business account update
+                    sc_ub(*json);
+                    break;
+
+                case makeNameid("sqac"):
+                    // storage quota allowance changed
+                    sc_sqac(*json);
+                    break;
+
+                case makeNameid("asp"):
+                    // new/update of a Set
+                    sc_asp(*json);
+                    break;
+
+                case makeNameid("ass"):
+                    sc_ass(*json);
+                    break;
+
+                case makeNameid("asr"):
+                    // removal of a Set
+                    sc_asr(*json);
+                    break;
+
+                case makeNameid("aep"):
+                    // new/update of a Set Element
+                    sc_aep(*json);
+                    break;
+
+                case makeNameid("aer"):
+                    // removal of a Set Element
+                    sc_aer(*json);
+                    break;
+                case makeNameid("pk"):
+                    // pending keys
+                    sc_pk(*json);
+                    break;
+
+                case makeNameid("uec"):
+                    // User Email Confirm (uec)
+                    sc_uec(*json);
+                    break;
+
+                case makeNameid("cce"):
+                    // credit card for this user is potentially expiring soon or new card is registered
+                    sc_cce(*json);
+                    break;
+            }
+        }
+        else
+        {
+            lastAPDeletedNode = nullptr;
+        }
+    }
+    sc_checkSequenceTag(string());
+    json->leaveobject();
+
+    return true;
 }
 
 } // namespace

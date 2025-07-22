@@ -1837,29 +1837,30 @@ public:
 
     // server-client command processing
     bool sc_checkSequenceTag(const string& tag);
-    bool sc_checkActionPacket(Node* lastAPDeletedNode);
+    bool sc_checkActionPacket(Node* lastAPDeletedNode, JSON& jsonsc);
 
-    void sc_updatenode();
-    std::shared_ptr<Node> sc_deltree();
-    handle sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMismatchedDelete);
-    void sc_contacts();
-    void sc_keys();
-    void sc_fileattr();
-    void sc_userattr();
-    bool sc_shares();
-    bool sc_upgrade(nameid paymentType);
-    void sc_paymentreminder();
-    void sc_opc();
-    void sc_ipc();
-    void sc_upc(bool incoming);
-    void sc_ph();
-    void sc_se();
+    void sc_updatenode(JSON& jsonsc);
+    std::shared_ptr<Node> sc_deltree(JSON& jsonsc);
+    handle sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMismatchedDelete, JSON& jsonsc);
+    void sc_contacts(JSON& jsonsc);
+    void sc_keys(JSON& jsonsc);
+    void sc_fileattr(JSON& jsonsc);
+    void sc_userattr(JSON& jsonsc);
+    bool sc_shares(JSON& jsonsc);
+    bool sc_upgrade(nameid paymentType, JSON& jsonsc);
+    void sc_paymentreminder(JSON& jsonsc);
+    void sc_opc(JSON& jsonsc);
+    void sc_ipc(JSON& jsonsc);
+    void sc_upc(bool incoming, JSON& jsonsc);
+    void sc_ph(JSON& jsonsc);
+    void sc_se(JSON& jsonsc);
+
 #ifdef ENABLE_CHAT
-    void sc_chatupdate(bool readingPublicChat);
-    void sc_chatnode();
-    void sc_chatflags();
-    void sc_scheduledmeetings();
-    void sc_delscheduledmeeting();
+    void sc_chatupdate(bool readingPublicChat, JSON& jsonsc);
+    void sc_chatnode(JSON& jsonsc);
+    void sc_chatflags(JSON& jsonsc);
+    void sc_scheduledmeetings(JSON& jsonsc);
+    void sc_delscheduledmeeting(JSON& jsonsc);
     void createNewSMAlert(const handle&, handle chatid, handle schedId, handle parentSchedId, m_time_t startDateTime);
     void createDeletedSMAlert(const handle&, handle chatid, handle schedId);
     void createUpdatedSMAlert(const handle&, handle chatid, handle schedId, handle parentSchedId,
@@ -1867,13 +1868,13 @@ public:
     static error parseScheduledMeetingChangeset(JSON*, UserAlert::UpdatedScheduledMeeting::Changeset*);
     void clearSchedOccurrences(TextChat& chat);
 #endif
-    void sc_uac();
-    void sc_uec();
-    void sc_la();
-    void sc_ub();
-    void sc_sqac();
-    void sc_pk();
-    void sc_cce();
+    void sc_uac(JSON& jsonsc);
+    void sc_uec(JSON& jsonsc);
+    void sc_la(JSON& jsonsc);
+    void sc_ub(JSON& jsonsc);
+    void sc_sqac(JSON& jsonsc);
+    void sc_pk(JSON& jsonsc);
+    void sc_cce(JSON& jsonsc);
 
     void init();
 
@@ -2073,6 +2074,25 @@ public:
     JSON jsonsc;
     bool insca;
     bool insca_notlast;
+
+    // Streaming parsing support for actionpackets
+    bool mActionPacketsStreamingEnabled;
+    JSONSplitter mActionPacketsJsonSplitter;
+    std::map<string, std::function<bool (JSON *)>> mActionPacketsFilters;
+    bool mActionPacketsFirstChunkProcessed;
+    
+    // Initialize streaming parsing for actionpackets
+    void initActionPacketsStreaming();
+    
+    // Process actionpackets with streaming parsing
+    bool processActionPacketsChunk(const char* chunk);
+    
+    // Setup filters for actionpackets streaming parsing
+    void setupActionPacketsFilters();
+    
+    // Process a single actionpacket object
+    bool processActionPacketObject(JSON* json);
+
 
     // no two interrelated client instances should ever have the same sessionid
     char sessionid[10];
@@ -2980,11 +3000,11 @@ private:
     bool decryptAttrs(const string& attrs, const string& decrKey, string_map& output);
     string encryptAttrs(const string_map& attrs, const string& encryptionKey);
 
-    void sc_asp(); // AP after new or updated Set
-    void sc_asr(); // AP after removed Set
-    void sc_aep(); // AP after new or updated Set Element
-    void sc_aer(); // AP after removed Set Element
-    void sc_ass(); // AP after exported set update
+    void sc_asp(JSON& jsonsc); // AP after new or updated Set
+    void sc_asr(JSON& jsonsc); // AP after removed Set
+    void sc_aep(JSON& jsonsc); // AP after new or updated Set Element
+    void sc_aer(JSON& jsonsc); // AP after removed Set Element
+    void sc_ass(JSON& jsonsc); // AP after exported set update
 
     bool initscsets();
     bool fetchscset(string* data, uint32_t id);
