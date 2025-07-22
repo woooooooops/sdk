@@ -6518,7 +6518,43 @@ void uploadLocalPath(nodetype_t type, std::string name, const LocalPath& localna
                     if (!allowDuplicateVersions && fp.isvalid && previousNode->isvalid && fp == *((FileFingerprint *)previousNode.get()))
                     {
                         cout << "Identical file already exist. Skipping transfer of " << name << endl;
-                        return;
+                        const string& nodekey = previousNode->nodekey();
+                        if (nodekey.size() == FILENODEKEYLENGTH)
+                        {
+                            auto fa2 = client->fsaccess->newfileaccess();
+                            if (fa2->fopen(localname, true, false, FSLogging::logOnError)) {
+                                bool match = CompareLocalFileMetaMacWithNodeKey(fa2.get(), nodekey, FILENODE);
+                                cout << "CompareLocalFileMetaMacWithNodeKey result: " << (match ? "MATCH" : "NO MATCH") << endl;
+
+                                if (match) {
+                                    cout << "File content matches remote (by MAC). Skipping upload, copying remote node: " << name << endl;
+                                    vector<NewNode> nn(1);
+                                    NewNode* newnode = &nn[0];
+                                    newnode->source = NEW_NODE;
+                                    newnode->nodehandle = previousNode->nodehandle;
+
+                                    newnode->type = previousNode->type;
+                                    newnode->nodekey = previousNode->nodekey();
+
+                                    AttrMap tattrs;
+                                    tattrs.map = previousNode->attrs.map;
+                                    string attrstring;
+                                    tattrs.getjson(&attrstring);
+                                    newnode->attrstring.reset(new string);
+
+                                    SymmCipher key;
+                                    key.setkey((const byte*)newnode->nodekey.data(), newnode->type);
+                                    client->makeattr(&key, newnode->attrstring, attrstring.c_str());
+
+                                    newnode->ovhandle = previousNode->nodeHandle();
+
+                                    client->putnodes(parent->nodeHandle(), vo, std::move(nn), nullptr, client->nextreqtag(), false);
+
+                                    total++;
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
                 else
